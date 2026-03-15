@@ -13,14 +13,38 @@ from urllib.request import Request, urlopen
 from dotenv import load_dotenv
 from weasyprint import HTML
 
+try:
+    from kaggle_secrets import UserSecretsClient  # type: ignore
+except ImportError:
+    UserSecretsClient = None
+
+def get_config_value(name: str, default: str = "") -> str:
+    """
+    Resolve config in this order:
+    1. Kaggle secrets (if available)
+    2. Environment variables / .env
+    3. Provided default
+    """
+    if UserSecretsClient is not None:
+        try:
+            user_secrets = UserSecretsClient()
+            value = user_secrets.get_secret(name)
+            if value is not None and str(value).strip() != "":
+                return str(value).strip()
+        except Exception:
+            pass
+
+    value = os.getenv(name, default)
+    return str(value).strip() if value is not None else default
+
 load_dotenv()
 
-CONFLUENCE_BASE_URL = os.getenv("CONFLUENCE_BASE_URL", "").rstrip("/")
-CONFLUENCE_EMAIL = os.getenv("CONFLUENCE_EMAIL", "")
-CONFLUENCE_API_TOKEN = os.getenv("CONFLUENCE_API_TOKEN", "")
-ROOT_ID = os.getenv("ROOT_ID", "").strip()
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "retrieved_docs"))
-POLLING_INTERVAL = int(os.getenv("POLLING_INTERVAL_IN_SECONDS", "2"))
+CONFLUENCE_BASE_URL = get_config_value("CONFLUENCE_BASE_URL", "").rstrip("/")
+CONFLUENCE_EMAIL = get_config_value("CONFLUENCE_EMAIL", "")
+CONFLUENCE_API_TOKEN = get_config_value("CONFLUENCE_API_TOKEN", "")
+ROOT_ID = get_config_value("ROOT_ID", "")
+OUTPUT_DIR = Path(get_config_value("OUTPUT_DIR", "retrieved_docs"))
+POLLING_INTERVAL = int(get_config_value("POLLING_INTERVAL_IN_SECONDS", "2"))
 
 # Add page/folder IDs here to skip completely.
 # If a folder ID is here, that whole subtree will not be traversed.
@@ -236,7 +260,6 @@ pre {{ white-space: pre-wrap; word-wrap: break-word; }}
 def write_pdf(html_text: str, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     HTML(string=html_text, base_url=CONFLUENCE_BASE_URL).write_pdf(str(path))
-
 
 def validate_env() -> None:
     if not CONFLUENCE_BASE_URL:
