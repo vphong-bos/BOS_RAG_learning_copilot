@@ -1,6 +1,9 @@
 python-dotenv
 markdownify
-faiss-cpu
 sentence-transformers
-pdfplumber
-pypdf
+chromadb
+langchain
+langchain-core 
+langchain-chroma
+langchain-text-splitters 
+langchain-huggingface

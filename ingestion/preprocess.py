@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 @dataclass
 class Chunk:
@@ -51,14 +52,10 @@ def normalize_whitespace(text: str) -> str:
 
 
 def remove_md_noise(text: str) -> str:
-    """
-    Remove common Markdown/conversion noise from Confluence-exported content.
-    """
     lines = text.splitlines()
     cleaned: List[str] = []
 
     noise_patterns = [
-        r"^\s*Page\s+\d+\s+of\s+\d+\s*$",
         r"^\s*Created with Confluence\s*$",
         r"^\s*Atlassian\s+Confluence\s*$",
         r"^\s*Powered by Atlassian\s*$",
@@ -75,27 +72,15 @@ def remove_md_noise(text: str) -> str:
         if any(re.match(pat, stripped.strip(), flags=re.IGNORECASE) for pat in noise_patterns):
             continue
 
-        # normalize bullets
         stripped = re.sub(r"^(\s*)[*•]\s+", r"\1- ", stripped)
-
-        # normalize excessive heading spacing: ##    Title -> ## Title
         stripped = re.sub(r"^(#{1,6})\s*", r"\1 ", stripped)
 
         cleaned.append(stripped)
 
-    text = "\n".join(cleaned)
-    text = normalize_whitespace(text)
-    return text
+    return normalize_whitespace("\n".join(cleaned))
 
 
 def merge_paragraph_lines(text: str) -> str:
-    """
-    Merge wrapped lines inside paragraphs, but preserve:
-    - markdown headings
-    - bullets
-    - numbered lists
-    - code fences
-    """
     lines = text.splitlines()
     result: List[str] = []
     paragraph_buffer: List[str] = []
@@ -105,7 +90,6 @@ def merge_paragraph_lines(text: str) -> str:
         nonlocal paragraph_buffer
         if not paragraph_buffer:
             return
-
         merged = paragraph_buffer[0]
         for line in paragraph_buffer[1:]:
             merged += " " + line.strip()
@@ -147,17 +131,10 @@ def merge_paragraph_lines(text: str) -> str:
         paragraph_buffer.append(stripped)
 
     flush_paragraph()
-
-    merged_text = "\n".join(result)
-    merged_text = re.sub(r"\n{3,}", "\n\n", merged_text)
-    return merged_text.strip()
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(result)).strip()
 
 
 def split_into_sections(text: str, fallback_title: str) -> List[Tuple[Optional[str], str]]:
-    """
-    Split markdown text by headings (#, ##, ###, ...).
-    Returns list of (section_title, section_text).
-    """
     lines = text.splitlines()
     sections: List[Tuple[Optional[str], List[str]]] = []
     current_title: Optional[str] = fallback_title
@@ -194,30 +171,34 @@ def split_into_sections(text: str, fallback_title: str) -> List[Tuple[Optional[s
     return final_sections
 
 
-def chunk_text(text: str, chunk_size: int = 350, chunk_overlap: int = 60) -> List[str]:
-    """
-    Word-based chunking.
-    """
-    words = text.split()
-    if not words:
-        return []
+def get_text_splitter(chunk_size: int, chunk_overlap: int) -> RecursiveCharacterTextSplitter:
+    return RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        length_function=len,
+        separators=[
+            "\n# ",
+            "\n## ",
+            "\n### ",
+            "\n#### ",
+            "\n##### ",
+            "\n###### ",
+            "\n\n",
+            "\n",
+            " ",
+            "",
+        ],
+    )
 
-    chunks: List[str] = []
-    start = 0
 
-    while start < len(words):
-        end = min(start + chunk_size, len(words))
-        chunk = " ".join(words[start:end]).strip()
-
-        if chunk:
-            chunks.append(chunk)
-
-        if end >= len(words):
-            break
-
-        start = max(0, end - chunk_overlap)
-
-    return chunks
+def split_section_content(
+    text: str,
+    chunk_size: int,
+    chunk_overlap: int,
+) -> List[str]:
+    splitter = get_text_splitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    chunks = splitter.split_text(text)
+    return [chunk.strip() for chunk in chunks if chunk and chunk.strip()]
 
 
 def preprocess_document(md_path: Path, chunk_size: int, chunk_overlap: int) -> List[Chunk]:
@@ -234,7 +215,7 @@ def preprocess_document(md_path: Path, chunk_size: int, chunk_overlap: int) -> L
     order = 0
 
     for section_title, section_text in sections:
-        subchunks = chunk_text(
+        subchunks = split_section_content(
             section_text,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
@@ -287,14 +268,14 @@ def main() -> None:
     parser.add_argument(
         "--chunk_size",
         type=int,
-        default=350,
-        help="Chunk size in words",
+        default=1200,
+        help="Chunk size in characters",
     )
     parser.add_argument(
         "--chunk_overlap",
         type=int,
-        default=60,
-        help="Chunk overlap in words",
+        default=200,
+        help="Chunk overlap in characters",
     )
     args = parser.parse_args()
 
@@ -341,6 +322,7 @@ def main() -> None:
         print("\nFailed files:")
         for name, err in failures:
             print(f"- {name}: {err}")
+
 
 if __name__ == "__main__":
     main()
