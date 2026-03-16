@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from ftfy import fix_text
 import argparse
 import json
 import re
@@ -28,20 +29,24 @@ def extract_doc_id_from_filename(path: Path) -> str:
         return match.group(1)
     return path.stem
 
-
 def extract_title_from_filename(path: Path) -> str:
     match = re.search(r"^(.*)_(\d+)\.md$", path.name)
     if match:
-        return match.group(1).strip()
-    return path.stem
-
+        return fix_text(match.group(1).strip())
+    return fix_text(path.stem)
 
 def read_md_text(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8").strip()
-    except Exception as exc:
-        raise RuntimeError(f"Failed to read Markdown file {path}: {exc}") from exc
+    encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
 
+    last_error = None
+    for enc in encodings:
+        try:
+            text = path.read_text(encoding=enc)
+            return fix_text(text).strip()
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(f"Failed to read Markdown file {path}: {last_error}")
 
 def normalize_whitespace(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -49,7 +54,6 @@ def normalize_whitespace(text: str) -> str:
     text = re.sub(r"[ \u00A0]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
-
 
 def remove_md_noise(text: str) -> str:
     lines = text.splitlines()
@@ -78,7 +82,6 @@ def remove_md_noise(text: str) -> str:
         cleaned.append(stripped)
 
     return normalize_whitespace("\n".join(cleaned))
-
 
 def merge_paragraph_lines(text: str) -> str:
     lines = text.splitlines()
@@ -133,6 +136,33 @@ def merge_paragraph_lines(text: str) -> str:
     flush_paragraph()
     return re.sub(r"\n{3,}", "\n\n", "\n".join(result)).strip()
 
+def split_text_and_code_blocks(text: str) -> List[Tuple[str, str]]:
+    """
+    Return list of (block_type, content)
+    block_type in {"text", "code"}
+    """
+    parts: List[Tuple[str, str]] = []
+    pattern = re.compile(r"```.*?```", re.DOTALL)
+
+    last_end = 0
+    for match in pattern.finditer(text):
+        if match.start() > last_end:
+            normal_text = text[last_end:match.start()].strip()
+            if normal_text:
+                parts.append(("text", normal_text))
+
+        code_block = match.group(0).strip()
+        if code_block:
+            parts.append(("code", code_block))
+
+        last_end = match.end()
+
+    if last_end < len(text):
+        tail = text[last_end:].strip()
+        if tail:
+            parts.append(("text", tail))
+
+    return parts
 
 def split_into_sections(text: str, fallback_title: str) -> List[Tuple[Optional[str], str]]:
     lines = text.splitlines()
@@ -170,7 +200,6 @@ def split_into_sections(text: str, fallback_title: str) -> List[Tuple[Optional[s
 
     return final_sections
 
-
 def get_text_splitter(chunk_size: int, chunk_overlap: int) -> RecursiveCharacterTextSplitter:
     return RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
@@ -190,16 +219,66 @@ def get_text_splitter(chunk_size: int, chunk_overlap: int) -> RecursiveCharacter
         ],
     )
 
-
 def split_section_content(
     text: str,
     chunk_size: int,
     chunk_overlap: int,
 ) -> List[str]:
     splitter = get_text_splitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    chunks = splitter.split_text(text)
-    return [chunk.strip() for chunk in chunks if chunk and chunk.strip()]
+    pieces = split_text_and_code_blocks(text)
 
+    chunks: List[str] = []
+
+    for block_type, content in pieces:
+        if block_type == "code":
+            if len(content) <= chunk_size:
+                chunks.append(content)
+            else:
+                code_chunks = splitter.split_text(content)
+                chunks.extend([x.strip() for x in code_chunks if x.strip()])
+        else:
+            text_chunks = splitter.split_text(content)
+            chunks.extend([x.strip() for x in text_chunks if x.strip()])
+
+    return chunks
+
+def merge_small_chunks(
+    chunks: List[str],
+    min_chunk_chars: int = 180,
+    max_chunk_chars: int = 1600,
+) -> List[str]:
+    if not chunks:
+        return []
+
+    merged: List[str] = []
+
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+
+        if not merged:
+            merged.append(chunk)
+            continue
+
+        is_small = len(chunk) < min_chunk_chars
+        can_merge_to_prev = len(merged[-1]) + 2 + len(chunk) <= max_chunk_chars
+
+        if is_small and can_merge_to_prev:
+            if merged[-1].endswith("```") or chunk.startswith("```"):
+                merged[-1] += "\n" + chunk
+            else:
+                merged[-1] += "\n\n" + chunk
+        else:
+            merged.append(chunk)
+
+    # handle first chunk if still too small by merging forward
+    if len(merged) >= 2 and len(merged[0]) < min_chunk_chars:
+        if len(merged[0]) + 2 + len(merged[1]) <= max_chunk_chars:
+            merged[1] = merged[0] + "\n\n" + merged[1]
+            merged = merged[1:]
+
+    return merged
 
 def preprocess_document(md_path: Path, chunk_size: int, chunk_overlap: int) -> List[Chunk]:
     raw_text = read_md_text(md_path)
@@ -221,13 +300,19 @@ def preprocess_document(md_path: Path, chunk_size: int, chunk_overlap: int) -> L
             chunk_overlap=chunk_overlap,
         )
 
+        subchunks = merge_small_chunks(
+            subchunks,
+            min_chunk_chars=180,
+            max_chunk_chars=max(chunk_size + chunk_overlap, chunk_size),
+        )
+
         for content in subchunks:
             chunks.append(
                 Chunk(
                     chunk_id=f"{doc_id}_{order}",
                     doc_id=doc_id,
                     section_title=section_title,
-                    content=content,
+                    content=fix_text(content).strip(),
                     order=order,
                     token_count=None,
                     embedding_id=None,
@@ -240,7 +325,6 @@ def preprocess_document(md_path: Path, chunk_size: int, chunk_overlap: int) -> L
             order += 1
 
     return chunks
-
 
 def write_jsonl(path: Path, rows: Iterable[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
