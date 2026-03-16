@@ -6,7 +6,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Set
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -17,6 +17,7 @@ try:
     from kaggle_secrets import UserSecretsClient  # type: ignore
 except ImportError:
     UserSecretsClient = None
+
 
 def get_config_value(name: str, default: str = "") -> str:
     """
@@ -37,6 +38,7 @@ def get_config_value(name: str, default: str = "") -> str:
     value = os.getenv(name, default)
     return str(value).strip() if value is not None else default
 
+
 load_dotenv()
 
 CONFLUENCE_BASE_URL = get_config_value("CONFLUENCE_BASE_URL", "").rstrip("/")
@@ -46,9 +48,9 @@ ROOT_ID = get_config_value("ROOT_ID", "")
 OUTPUT_DIR = Path(get_config_value("OUTPUT_DIR", "retrieved_docs"))
 POLLING_INTERVAL = int(get_config_value("POLLING_INTERVAL_IN_SECONDS", "2"))
 
-# Add page/folder IDs here to skip completely.
-# If a folder ID is here, that whole subtree will not be traversed.
-SKIP_IDS = {
+# Only keep IDs here if you want to skip them manually.
+# If a folder ID is here, its whole subtree will not be traversed.
+MANUAL_SKIP_IDS: Set[str] = {
     "116621984",
     "158960566",
 }
@@ -87,6 +89,24 @@ def http_json(url: str, method: str = "GET", headers=None, body=None) -> dict:
         raise RuntimeError(f"HTTP {exc.code} calling {url}\n{detail}") from exc
     except URLError as exc:
         raise RuntimeError(f"Network error calling {url}: {exc}") from exc
+
+
+def get_existing_pdf_page_ids(output_dir: Path) -> Set[str]:
+    """
+    Scan OUTPUT_DIR and extract page IDs from filenames like:
+    some_title_123456.pdf
+    """
+    existing_ids: Set[str] = set()
+
+    if not output_dir.exists():
+        return existing_ids
+
+    for pdf_file in output_dir.glob("*.pdf"):
+        match = re.search(r"_(\d+)\.pdf$", pdf_file.name)
+        if match:
+            existing_ids.add(match.group(1))
+
+    return existing_ids
 
 
 class ConfluenceClient:
@@ -153,12 +173,12 @@ class ConfluenceClient:
 
         return []
 
-    def collect_page_and_folder_items(self, root_folder_id: str) -> List[dict]:
+    def collect_page_and_folder_items(self, root_folder_id: str, skip_ids: Set[str]) -> List[dict]:
         items: List[dict] = []
         seen = set()
 
         def walk(content_type: str, content_id: str) -> None:
-            if content_id in SKIP_IDS:
+            if content_id in skip_ids:
                 print(f"  SKIP: subtree skipped for {content_type} {content_id}")
                 return
 
@@ -175,7 +195,7 @@ class ConfluenceClient:
                 if child_type not in {"page", "folder"}:
                     continue
 
-                if child_id in SKIP_IDS:
+                if child_id in skip_ids:
                     print(f"  SKIP: {child_type} {child.get('title') or child_id} ({child_id})")
                     continue
 
@@ -261,6 +281,7 @@ def write_pdf(html_text: str, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     HTML(string=html_text, base_url=CONFLUENCE_BASE_URL).write_pdf(str(path))
 
+
 def validate_env() -> None:
     if not CONFLUENCE_BASE_URL:
         raise RuntimeError("Missing CONFLUENCE_BASE_URL in .env")
@@ -331,11 +352,17 @@ def export_tree() -> None:
     client = ConfluenceClient()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    existing_pdf_ids = get_existing_pdf_page_ids(OUTPUT_DIR)
+
+    print(f"Existing exported PDFs: {len(existing_pdf_ids)}")
+    if existing_pdf_ids:
+        print("Existing page IDs:", ", ".join(sorted(existing_pdf_ids)))
+
     root = client.get_root_folder_info(ROOT_ID)
     root_title = root.get("title", ROOT_ID)
     print(f"Root folder: {root_title} ({ROOT_ID})")
 
-    items = client.collect_page_and_folder_items(ROOT_ID)
+    items = client.collect_page_and_folder_items(ROOT_ID, MANUAL_SKIP_IDS)
     print(f"Items found: {len(items)}")
     print_type_summary(items)
     print_tree(items, ROOT_ID, root_title)
@@ -348,13 +375,22 @@ def export_tree() -> None:
     print(f"Pages found: {len(pages)}\n")
 
     failures = []
+    exported_count = 0
+    skipped_existing_count = 0
+    skipped_manual_count = 0
 
     for i, page in enumerate(pages, start=1):
         page_id = page["id"]
         title = page["title"]
 
-        if page_id in SKIP_IDS:
-            print(f"[{i}/{len(pages)}] SKIP export: {title} ({page_id})")
+        if page_id in MANUAL_SKIP_IDS:
+            print(f"[{i}/{len(pages)}] SKIP manual: {title} ({page_id})")
+            skipped_manual_count += 1
+            continue
+
+        if page_id in existing_pdf_ids:
+            print(f"[{i}/{len(pages)}] SKIP existing PDF: {title} ({page_id})")
+            skipped_existing_count += 1
             continue
 
         safe = sanitize_filename(title)
@@ -371,18 +407,22 @@ def export_tree() -> None:
             write_pdf(full_html, pdf_file)
 
             print("  Saved PDF:", pdf_file)
+            exported_count += 1
         except Exception as exc:
             print("  ERROR:", exc)
             failures.append((page_id, title, str(exc)))
 
     print()
-    print(f"Pages exported to PDF: {len(pages) - len(failures)}/{len(pages)}")
+    print(f"Pages total: {len(pages)}")
+    print(f"Pages exported now: {exported_count}")
+    print(f"Pages skipped (existing PDF): {skipped_existing_count}")
+    print(f"Pages skipped (manual): {skipped_manual_count}")
+    print(f"Pages failed: {len(failures)}")
 
     if failures:
         print("\nFailed pages:")
         for page_id, title, err in failures:
             print(f"- {title} ({page_id}): {err}")
-
 
 if __name__ == "__main__":
     export_tree()
