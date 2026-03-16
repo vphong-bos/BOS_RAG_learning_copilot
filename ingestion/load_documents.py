@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
-from weasyprint import HTML
+from markdownify import markdownify as md
 
 try:
     from kaggle_secrets import UserSecretsClient  # type: ignore
@@ -61,6 +61,20 @@ def sanitize_filename(name: str) -> str:
     name = re.sub(r"\s+", " ", name).strip()
     return name[:180] or "untitled"
 
+def html_to_markdown(html_text: str) -> str:
+    """
+    Convert Confluence export HTML to Markdown.
+    """
+    markdown = md(
+        html_text,
+        heading_style="ATX",
+        bullets="-",
+    )
+
+    markdown = re.sub(r"\n{3,}", "\n\n", markdown)
+
+    return markdown.strip()
+
 
 def build_auth_header(email: str, api_token: str) -> str:
     raw = f"{email}:{api_token}".encode("utf-8")
@@ -89,25 +103,6 @@ def http_json(url: str, method: str = "GET", headers=None, body=None) -> dict:
         raise RuntimeError(f"HTTP {exc.code} calling {url}\n{detail}") from exc
     except URLError as exc:
         raise RuntimeError(f"Network error calling {url}: {exc}") from exc
-
-
-def get_existing_pdf_page_ids(output_dir: Path) -> Set[str]:
-    """
-    Scan OUTPUT_DIR and extract page IDs from filenames like:
-    some_title_123456.pdf
-    """
-    existing_ids: Set[str] = set()
-
-    if not output_dir.exists():
-        return existing_ids
-
-    for pdf_file in output_dir.glob("*.pdf"):
-        match = re.search(r"_(\d+)\.pdf$", pdf_file.name)
-        if match:
-            existing_ids.add(match.group(1))
-
-    return existing_ids
-
 
 class ConfluenceClient:
     def headers(self) -> Dict[str, str]:
@@ -247,41 +242,6 @@ class ConfluenceClient:
 
             raise RuntimeError(f"Conversion failed: {json.dumps(result)}")
 
-
-def build_html(title: str, body_html: str) -> str:
-    safe_title = html.escape(title)
-
-    return f"""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-@page {{ size: A4; margin: 18mm 14mm; }}
-body {{ font-family: Arial, sans-serif; margin: 0; color: #222; }}
-h1 {{ border-bottom: 1px solid #ccc; padding-bottom: 10px; margin-bottom: 20px; }}
-h2, h3, h4, h5, h6 {{ page-break-after: avoid; }}
-img {{ max-width: 100%; height: auto; }}
-table {{ border-collapse: collapse; width: 100%; }}
-td, th {{ border: 1px solid #ccc; padding: 6px; vertical-align: top; }}
-pre {{ white-space: pre-wrap; word-wrap: break-word; }}
-.wrapper {{ padding: 24px; }}
-</style>
-</head>
-<body>
-<div class="wrapper">
-  <h1>{safe_title}</h1>
-  {body_html}
-</div>
-</body>
-</html>
-"""
-
-
-def write_pdf(html_text: str, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    HTML(string=html_text, base_url=CONFLUENCE_BASE_URL).write_pdf(str(path))
-
-
 def validate_env() -> None:
     if not CONFLUENCE_BASE_URL:
         raise RuntimeError("Missing CONFLUENCE_BASE_URL in .env")
@@ -352,11 +312,15 @@ def export_tree() -> None:
     client = ConfluenceClient()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    existing_pdf_ids = get_existing_pdf_page_ids(OUTPUT_DIR)
+    existing_md_ids = {
+        re.search(r"_(\d+)\.md$", f.name).group(1)
+        for f in OUTPUT_DIR.glob("*.md")
+        if re.search(r"_(\d+)\.md$", f.name)
+    }
 
-    print(f"Existing exported PDFs: {len(existing_pdf_ids)}")
-    if existing_pdf_ids:
-        print("Existing page IDs:", ", ".join(sorted(existing_pdf_ids)))
+    print(f"Existing exported Markdown files: {len(existing_md_ids)}")
+    if existing_md_ids:
+        print("Existing page IDs:", ", ".join(sorted(existing_md_ids)))
 
     root = client.get_root_folder_info(ROOT_ID)
     root_title = root.get("title", ROOT_ID)
@@ -388,13 +352,13 @@ def export_tree() -> None:
             skipped_manual_count += 1
             continue
 
-        if page_id in existing_pdf_ids:
-            print(f"[{i}/{len(pages)}] SKIP existing PDF: {title} ({page_id})")
+        if page_id in existing_md_ids:
+            print(f"[{i}/{len(pages)}] SKIP existing md: {title} ({page_id})")
             skipped_existing_count += 1
             continue
 
         safe = sanitize_filename(title)
-        pdf_file = OUTPUT_DIR / f"{safe}_{page_id}.pdf"
+        md_file = OUTPUT_DIR / f"{safe}_{page_id}.md"
 
         print(f"[{i}/{len(pages)}] Exporting page: {title} ({page_id})")
 
@@ -403,10 +367,11 @@ def export_tree() -> None:
             async_id = client.start_export_conversion(page_id, storage)
             export_html = client.wait_for_export(async_id)
 
-            full_html = build_html(title, export_html)
-            write_pdf(full_html, pdf_file)
+            markdown = html_to_markdown(export_html)
 
-            print("  Saved PDF:", pdf_file)
+            md_file.write_text(markdown, encoding="utf-8")
+
+            print("  Saved Markdown:", md_file)
             exported_count += 1
         except Exception as exc:
             print("  ERROR:", exc)
@@ -415,7 +380,7 @@ def export_tree() -> None:
     print()
     print(f"Pages total: {len(pages)}")
     print(f"Pages exported now: {exported_count}")
-    print(f"Pages skipped (existing PDF): {skipped_existing_count}")
+    print(f"Pages skipped (existing md): {skipped_existing_count}")
     print(f"Pages skipped (manual): {skipped_manual_count}")
     print(f"Pages failed: {len(failures)}")
 

@@ -1,4 +1,6 @@
 python-dotenv
-weasyprint
+markdownify
 faiss-cpu
 sentence-transformers
+pdfplumber
+pypdf
