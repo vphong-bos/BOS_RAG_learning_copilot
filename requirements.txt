@@ -1,3 +1,4 @@
 python-dotenv
 weasyprint
 faiss-cpu
+sentence-transformers
