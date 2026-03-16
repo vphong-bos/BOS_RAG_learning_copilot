@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-from ftfy import fix_text
 import argparse
 import json
 import re
@@ -9,7 +8,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from ftfy import fix_text
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 
 @dataclass
 class Chunk:
@@ -20,6 +21,7 @@ class Chunk:
     order: int
     token_count: Optional[int] = None
     embedding_id: Optional[str] = None
+    ref_links: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -29,11 +31,13 @@ def extract_doc_id_from_filename(path: Path) -> str:
         return match.group(1)
     return path.stem
 
+
 def extract_title_from_filename(path: Path) -> str:
     match = re.search(r"^(.*)_(\d+)\.md$", path.name)
     if match:
         return fix_text(match.group(1).strip())
     return fix_text(path.stem)
+
 
 def read_md_text(path: Path) -> str:
     encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
@@ -48,12 +52,14 @@ def read_md_text(path: Path) -> str:
 
     raise RuntimeError(f"Failed to read Markdown file {path}: {last_error}")
 
+
 def normalize_whitespace(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\t", " ")
     text = re.sub(r"[ \u00A0]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
 
 def remove_md_noise(text: str) -> str:
     lines = text.splitlines()
@@ -83,6 +89,7 @@ def remove_md_noise(text: str) -> str:
 
     return normalize_whitespace("\n".join(cleaned))
 
+
 def merge_paragraph_lines(text: str) -> str:
     lines = text.splitlines()
     result: List[str] = []
@@ -93,6 +100,7 @@ def merge_paragraph_lines(text: str) -> str:
         nonlocal paragraph_buffer
         if not paragraph_buffer:
             return
+
         merged = paragraph_buffer[0]
         for line in paragraph_buffer[1:]:
             merged += " " + line.strip()
@@ -136,62 +144,108 @@ def merge_paragraph_lines(text: str) -> str:
     flush_paragraph()
     return re.sub(r"\n{3,}", "\n\n", "\n".join(result)).strip()
 
+
+def split_markdown_blocks(text: str) -> List[Tuple[str, str]]:
+    """
+    Split markdown into block-level pieces:
+    - ("code", fenced code block)
+    - ("heading", heading line)
+    - ("text", normal text block)
+    """
+    blocks: List[Tuple[str, str]] = []
+    lines = text.splitlines()
+
+    in_code_block = False
+    text_buffer: List[str] = []
+    code_buffer: List[str] = []
+
+    def flush_text_buffer() -> None:
+        nonlocal text_buffer
+        if text_buffer:
+            content = "\n".join(text_buffer).strip()
+            if content:
+                blocks.append(("text", content))
+            text_buffer = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            if in_code_block:
+                code_buffer.append(line)
+                content = "\n".join(code_buffer).strip()
+                if content:
+                    blocks.append(("code", content))
+                code_buffer = []
+                in_code_block = False
+            else:
+                flush_text_buffer()
+                in_code_block = True
+                code_buffer = [line]
+            continue
+
+        if in_code_block:
+            code_buffer.append(line)
+            continue
+
+        if re.match(r"^#{1,6}\s+.+$", stripped):
+            flush_text_buffer()
+            blocks.append(("heading", stripped))
+            continue
+
+        text_buffer.append(line)
+
+    if code_buffer:
+        content = "\n".join(code_buffer).strip()
+        if content:
+            blocks.append(("code", content))
+
+    flush_text_buffer()
+    return blocks
+
+
 def split_text_and_code_blocks(text: str) -> List[Tuple[str, str]]:
     """
     Return list of (block_type, content)
     block_type in {"text", "code"}
     """
     parts: List[Tuple[str, str]] = []
-    pattern = re.compile(r"```.*?```", re.DOTALL)
-
-    last_end = 0
-    for match in pattern.finditer(text):
-        if match.start() > last_end:
-            normal_text = text[last_end:match.start()].strip()
-            if normal_text:
-                parts.append(("text", normal_text))
-
-        code_block = match.group(0).strip()
-        if code_block:
-            parts.append(("code", code_block))
-
-        last_end = match.end()
-
-    if last_end < len(text):
-        tail = text[last_end:].strip()
-        if tail:
-            parts.append(("text", tail))
-
+    for block_type, content in split_markdown_blocks(text):
+        if block_type == "heading":
+            if content:
+                parts.append(("text", content))
+        else:
+            if content:
+                parts.append((block_type, content))
     return parts
 
+
 def split_into_sections(text: str, fallback_title: str) -> List[Tuple[Optional[str], str]]:
-    lines = text.splitlines()
+    blocks = split_markdown_blocks(text)
+
     sections: List[Tuple[Optional[str], List[str]]] = []
     current_title: Optional[str] = fallback_title
     current_body: List[str] = []
 
-    for line in lines:
-        stripped = line.strip()
-        heading_match = re.match(r"^(#{1,6})\s+(.*)$", stripped)
-
-        if heading_match:
+    for block_type, content in blocks:
+        if block_type == "heading":
             if current_body:
-                body = "\n".join(current_body).strip()
+                body = "\n\n".join(part for part in current_body if part.strip()).strip()
                 if body:
                     sections.append((current_title, current_body))
-            current_title = heading_match.group(2).strip()
+            current_title = re.sub(r"^#{1,6}\s+", "", content).strip()
             current_body = []
         else:
-            current_body.append(line)
+            current_body.append(content)
 
     if current_body:
-        body = "\n".join(current_body).strip()
+        body = "\n\n".join(part for part in current_body if part.strip()).strip()
         if body:
             sections.append((current_title, current_body))
 
     final_sections: List[Tuple[Optional[str], str]] = []
-    for title, body_lines in sections:
-        body = "\n".join(body_lines).strip()
+    for title, body_parts in sections:
+        body = "\n\n".join(part for part in body_parts if part.strip()).strip()
         if body:
             final_sections.append((title, body))
 
@@ -199,6 +253,7 @@ def split_into_sections(text: str, fallback_title: str) -> List[Tuple[Optional[s
         final_sections.append((fallback_title, text.strip()))
 
     return final_sections
+
 
 def get_text_splitter(chunk_size: int, chunk_overlap: int) -> RecursiveCharacterTextSplitter:
     return RecursiveCharacterTextSplitter(
@@ -219,11 +274,8 @@ def get_text_splitter(chunk_size: int, chunk_overlap: int) -> RecursiveCharacter
         ],
     )
 
-def split_section_content(
-    text: str,
-    chunk_size: int,
-    chunk_overlap: int,
-) -> List[str]:
+
+def split_section_content(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
     splitter = get_text_splitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     pieces = split_text_and_code_blocks(text)
 
@@ -241,6 +293,7 @@ def split_section_content(
             chunks.extend([x.strip() for x in text_chunks if x.strip()])
 
     return chunks
+
 
 def merge_small_chunks(
     chunks: List[str],
@@ -272,13 +325,101 @@ def merge_small_chunks(
         else:
             merged.append(chunk)
 
-    # handle first chunk if still too small by merging forward
     if len(merged) >= 2 and len(merged[0]) < min_chunk_chars:
         if len(merged[0]) + 2 + len(merged[1]) <= max_chunk_chars:
             merged[1] = merged[0] + "\n\n" + merged[1]
             merged = merged[1:]
 
     return merged
+
+
+def dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    output: List[str] = []
+    for item in items:
+        value = item.strip()
+        if value and value not in seen:
+            seen.add(value)
+            output.append(value)
+    return output
+
+
+def extract_links_and_clean_text_block(text: str) -> Tuple[str, List[str]]:
+    """
+    Clean links in non-code text blocks.
+
+    Supported:
+    - [label](url)      -> label
+    - <https://...>     -> https://...
+    - bare https://...  -> keep as-is
+
+    URLs are collected into ref_links.
+    """
+    collected_links: List[str] = []
+
+    # Markdown links
+    def replace_markdown_link(match: re.Match[str]) -> str:
+        label = match.group(1).strip()
+        url = match.group(2).strip()
+
+        if url:
+            collected_links.append(url)
+
+        return label if label else url
+
+    text = re.sub(
+        r"\[([^\]]+)\]\((https?://[^\s)]+(?:\)[^\s)]*)*)\)",
+        replace_markdown_link,
+        text,
+    )
+
+    # Angle links
+    def replace_angle_link(match: re.Match[str]) -> str:
+        url = match.group(1).strip()
+        if url:
+            collected_links.append(url)
+        return url
+
+    text = re.sub(r"<(https?://[^>\s]+)>", replace_angle_link, text)
+
+    # Bare URLs
+    def replace_bare_url(match: re.Match[str]) -> str:
+        url = match.group(1).strip()
+        if url:
+            collected_links.append(url)
+        return url
+
+    text = re.sub(r"(?<![\w(/])((?:https?://)[^\s<>\]]+)", replace_bare_url, text)
+
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text, dedupe_preserve_order(collected_links)
+
+
+def clean_links_preserving_code_blocks(text: str) -> Tuple[str, List[str]]:
+    blocks = split_markdown_blocks(text)
+
+    cleaned_parts: List[str] = []
+    all_links: List[str] = []
+
+    for block_type, content in blocks:
+        if block_type == "code":
+            cleaned_parts.append(content)
+        elif block_type == "heading":
+            cleaned_content, links = extract_links_and_clean_text_block(content)
+            if cleaned_content:
+                cleaned_parts.append(cleaned_content)
+            all_links.extend(links)
+        else:
+            cleaned_content, links = extract_links_and_clean_text_block(content)
+            if cleaned_content:
+                cleaned_parts.append(cleaned_content)
+            all_links.extend(links)
+
+    cleaned_text = "\n\n".join(part for part in cleaned_parts if part.strip())
+    cleaned_text = re.sub(r"\n{3,}", "\n\n", cleaned_text).strip()
+
+    return cleaned_text, dedupe_preserve_order(all_links)
+
 
 def preprocess_document(md_path: Path, chunk_size: int, chunk_overlap: int) -> List[Chunk]:
     raw_text = read_md_text(md_path)
@@ -306,16 +447,23 @@ def preprocess_document(md_path: Path, chunk_size: int, chunk_overlap: int) -> L
             max_chunk_chars=max(chunk_size + chunk_overlap, chunk_size),
         )
 
-        for content in subchunks:
+        for raw_chunk_content in subchunks:
+            normalized_chunk = fix_text(raw_chunk_content).strip()
+            final_content, extracted_links = clean_links_preserving_code_blocks(normalized_chunk)
+
+            if not final_content:
+                continue
+
             chunks.append(
                 Chunk(
                     chunk_id=f"{doc_id}_{order}",
                     doc_id=doc_id,
                     section_title=section_title,
-                    content=fix_text(content).strip(),
+                    content=final_content,
                     order=order,
                     token_count=None,
                     embedding_id=None,
+                    ref_links=extracted_links,
                     metadata={
                         "title": title,
                         "source_file": str(md_path),
@@ -326,6 +474,7 @@ def preprocess_document(md_path: Path, chunk_size: int, chunk_overlap: int) -> L
 
     return chunks
 
+
 def write_jsonl(path: Path, rows: Iterable[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -335,7 +484,7 @@ def write_jsonl(path: Path, rows: Iterable[dict]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Preprocess Markdown files into Chunk JSONL for embeddings / FAISS."
+        description="Preprocess Markdown files into Chunk JSONL for embeddings / ChromaDB."
     )
     parser.add_argument(
         "--input_dir",
