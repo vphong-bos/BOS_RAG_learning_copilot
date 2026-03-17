@@ -556,6 +556,5 @@ def main() -> None:
         for name, err in failures:
             print(f"- {name}: {err}")
 
-
 if __name__ == "__main__":
     main()
